@@ -1,10 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
+import { createGzip, gzipSync, gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  MIN_DATABASE_BACKUP_GZIP_BYTES,
+  runDatabaseBackup,
+  runDatabaseRestore,
+  validateDatabaseBackupArtifact,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -45,12 +51,6 @@ afterEach(async () => {
   }
 }, 60_000);
 
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping embedded Postgres backup tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
-}
-
 describe("createBufferedTextFileWriter", () => {
   it("preserves line boundaries across buffered flushes", async () => {
     const tempDir = createTempDir("paperclip-buffered-writer-");
@@ -71,6 +71,32 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres backup tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+describe("validateDatabaseBackupArtifact", () => {
+  it("rejects near-empty gzip artifacts", () => {
+    const tempDir = createTempDir("paperclip-backup-artifact-empty-");
+    const emptyGzipPath = path.join(tempDir, "paperclip-empty.sql.gz");
+    fs.writeFileSync(emptyGzipPath, gzipSync(""));
+
+    expect(() => validateDatabaseBackupArtifact(emptyGzipPath)).toThrow(/too small|no SQL payload/i);
+  });
+
+  it("accepts a valid gzip backup payload", () => {
+    const tempDir = createTempDir("paperclip-backup-artifact-valid-");
+    const backupPath = path.join(tempDir, "paperclip-valid.sql.gz");
+    const sql = "-- Paperclip database backup\nSELECT 1;\n";
+    fs.writeFileSync(backupPath, gzipSync(sql));
+
+    expect(() => validateDatabaseBackupArtifact(backupPath)).not.toThrow();
+    expect(fs.statSync(backupPath).size).toBeGreaterThan(20);
   });
 });
 
@@ -599,6 +625,61 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       } finally {
         await restoreSql.end();
       }
+    },
+    20_000,
+  );
+
+  it(
+    "does not leave a final empty .sql.gz when pg_dump fails in auto mode",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-pgdump-fail-");
+      const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+
+      try {
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-pgdump-fail-test",
+          backupEngine: "auto",
+        });
+
+        const gzipFiles = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz"));
+        expect(gzipFiles).toHaveLength(1);
+        expect(result.backupFile).toMatch(/paperclip-pgdump-fail-test-.*\.sql\.gz$/);
+        for (const name of gzipFiles) {
+          const fullPath = path.join(backupDir, name);
+          expect(fs.statSync(fullPath).size).toBeGreaterThan(MIN_DATABASE_BACKUP_GZIP_BYTES);
+          validateDatabaseBackupArtifact(fullPath);
+        }
+        expect(fs.existsSync(`${result.backupFile}.partial`)).toBe(false);
+      } finally {
+        if (originalPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+        }
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "fails closed when restore input is an empty gzip artifact",
+    async () => {
+      const restoreConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-restore-empty-gz-");
+      const backupFile = path.join(backupDir, "empty.sql.gz");
+      fs.writeFileSync(backupFile, gzipSync(""));
+
+      await expect(
+        runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile,
+        }),
+      ).rejects.toThrow(/too small|no SQL payload/i);
     },
     20_000,
   );
