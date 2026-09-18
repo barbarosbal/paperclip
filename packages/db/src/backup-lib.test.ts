@@ -103,6 +103,33 @@ describe("validateDatabaseBackupArtifact", () => {
     await expect(validateDatabaseBackupArtifact(backupPath)).resolves.toBeUndefined();
     expect(fs.statSync(backupPath).size).toBeGreaterThanOrEqual(MIN_DATABASE_BACKUP_GZIP_BYTES);
   });
+
+  it("rejects gzip artifacts with corrupted tails after a valid prefix", async () => {
+    const tempDir = createTempDir("paperclip-backup-artifact-corrupt-tail-");
+    const backupPath = path.join(tempDir, "paperclip-corrupt.sql.gz");
+    let sql = "-- Paperclip database backup\nSELECT 1;\n";
+    let gz = gzipSync(sql);
+    while (gz.length < MIN_DATABASE_BACKUP_GZIP_BYTES) {
+      sql += `SELECT ${gz.length};\n`;
+      gz = gzipSync(sql);
+    }
+    const corrupted = Buffer.concat([gz.subarray(0, gz.length - 8), Buffer.from("00000000", "ascii")]);
+    fs.writeFileSync(backupPath, corrupted);
+
+    await expect(validateDatabaseBackupArtifact(backupPath)).rejects.toThrow(/not readable gzip/i);
+  });
+
+  it("validates large gzip backups without retaining the full decompressed payload", async () => {
+    const tempDir = createTempDir("paperclip-backup-artifact-large-");
+    const backupPath = path.join(tempDir, "paperclip-large.sql.gz");
+    const padding = "-- padding\n".repeat(32_000);
+    const sql = `-- Paperclip database backup\nSELECT 1;\n${padding}`;
+    const gz = gzipSync(sql);
+    expect(gz.length).toBeGreaterThanOrEqual(MIN_DATABASE_BACKUP_GZIP_BYTES);
+    fs.writeFileSync(backupPath, gz);
+
+    await expect(validateDatabaseBackupArtifact(backupPath)).resolves.toBeUndefined();
+  });
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {

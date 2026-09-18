@@ -126,27 +126,20 @@ function readBoundedGzipSqlPreview(backupFile: string): Promise<string> {
     const gunzip = createGunzip();
     const input = createReadStream(backupFile);
 
-    const finish = () => {
-      input.destroy();
-      gunzip.destroy();
-      resolve(Buffer.concat(chunks).toString("utf8").trim());
-    };
-
     gunzip.on("data", (chunk: Buffer) => {
       const remaining = BACKUP_VALIDATION_MAX_DECOMPRESSED_BYTES - decompressedBytes;
       if (remaining <= 0) {
-        finish();
         return;
       }
 
       const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
       chunks.push(slice);
       decompressedBytes += slice.length;
-      if (decompressedBytes >= BACKUP_VALIDATION_MAX_DECOMPRESSED_BYTES) {
-        finish();
-      }
     });
-    gunzip.on("end", finish);
+    gunzip.on("end", () => {
+      input.destroy();
+      resolve(Buffer.concat(chunks).toString("utf8").trim());
+    });
     gunzip.on("error", (error) => {
       input.destroy();
       reject(error);
