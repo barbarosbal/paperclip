@@ -1,10 +1,13 @@
 import {
+  closeSync,
   createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -14,7 +17,7 @@ import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
-import { createGunzip, createGzip, gunzipSync } from "node:zlib";
+import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
 
 export type BackupRetentionPolicy = {
@@ -84,6 +87,8 @@ const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 /** Empty/near-empty gzip headers from a failed pg_dump probe are ~20 bytes. */
 export const MIN_DATABASE_BACKUP_GZIP_BYTES = 64;
+/** Upper bound on decompressed bytes read while validating backup artifacts. */
+const BACKUP_VALIDATION_MAX_DECOMPRESSED_BYTES = 256 * 1024;
 const BACKUP_PARTIAL_SUFFIX = ".partial";
 
 function isGzipCompressedBackupPath(filePath: string): boolean {
@@ -103,18 +108,69 @@ function removeBackupFileIfPresent(filePath: string): void {
   }
 }
 
-function readBackupSqlPayload(backupFile: string): string {
-  if (isGzipCompressedBackupPath(backupFile)) {
-    return gunzipSync(readFileSync(backupFile)).toString("utf8").trim();
+function readBoundedPlainSqlPreview(backupFile: string): string {
+  const fd = openSync(backupFile, "r");
+  try {
+    const preview = Buffer.alloc(BACKUP_VALIDATION_MAX_DECOMPRESSED_BYTES);
+    const bytesRead = readSync(fd, preview, 0, preview.length, 0);
+    return preview.subarray(0, bytesRead).toString("utf8").trim();
+  } finally {
+    closeSync(fd);
   }
-  return readFileSync(backupFile, "utf8").trim();
+}
+
+function readBoundedGzipSqlPreview(backupFile: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let decompressedBytes = 0;
+    const chunks: Buffer[] = [];
+    const gunzip = createGunzip();
+    const input = createReadStream(backupFile);
+
+    const finish = () => {
+      input.destroy();
+      gunzip.destroy();
+      resolve(Buffer.concat(chunks).toString("utf8").trim());
+    };
+
+    gunzip.on("data", (chunk: Buffer) => {
+      const remaining = BACKUP_VALIDATION_MAX_DECOMPRESSED_BYTES - decompressedBytes;
+      if (remaining <= 0) {
+        finish();
+        return;
+      }
+
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      chunks.push(slice);
+      decompressedBytes += slice.length;
+      if (decompressedBytes >= BACKUP_VALIDATION_MAX_DECOMPRESSED_BYTES) {
+        finish();
+      }
+    });
+    gunzip.on("end", finish);
+    gunzip.on("error", (error) => {
+      input.destroy();
+      reject(error);
+    });
+    input.on("error", (error) => {
+      gunzip.destroy();
+      reject(error);
+    });
+    input.pipe(gunzip);
+  });
+}
+
+async function readBoundedBackupSqlPreview(backupFile: string): Promise<string> {
+  if (isGzipCompressedBackupPath(backupFile)) {
+    return readBoundedGzipSqlPreview(backupFile);
+  }
+  return readBoundedPlainSqlPreview(backupFile);
 }
 
 /**
  * Reject empty/near-empty gzip artifacts and empty SQL payloads before a backup
  * can be treated as successful or selected for restore.
  */
-export function validateDatabaseBackupArtifact(backupFile: string): void {
+export async function validateDatabaseBackupArtifact(backupFile: string): Promise<void> {
   if (!existsSync(backupFile)) {
     throw new Error(`Backup file not found: ${basename(backupFile)}`);
   }
@@ -128,7 +184,7 @@ export function validateDatabaseBackupArtifact(backupFile: string): void {
 
   let payload = "";
   try {
-    payload = readBackupSqlPayload(backupFile);
+    payload = await readBoundedBackupSqlPreview(backupFile);
   } catch (error) {
     throw new Error(
       `Backup file is not readable gzip/SQL content: ${basename(backupFile)} (${sanitizeRestoreErrorMessage(error)})`,
@@ -141,10 +197,10 @@ export function validateDatabaseBackupArtifact(backupFile: string): void {
 }
 
 async function finalizeCompressedBackup(finalBackupFile: string, partialBackupFile: string): Promise<number> {
-  validateDatabaseBackupArtifact(partialBackupFile);
+  await validateDatabaseBackupArtifact(partialBackupFile);
   removeBackupFileIfPresent(finalBackupFile);
   renameSync(partialBackupFile, finalBackupFile);
-  validateDatabaseBackupArtifact(finalBackupFile);
+  await validateDatabaseBackupArtifact(finalBackupFile);
   return statSync(finalBackupFile).size;
 }
 
@@ -641,7 +697,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
-        validateDatabaseBackupArtifact(backupFile);
+        await validateDatabaseBackupArtifact(backupFile);
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
           backupFile,
@@ -1145,7 +1201,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 }
 
 export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
-  validateDatabaseBackupArtifact(opts.backupFile);
+  await validateDatabaseBackupArtifact(opts.backupFile);
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   let psqlRestoreError: unknown = null;
   try {

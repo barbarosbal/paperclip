@@ -79,7 +79,7 @@ function readLastFailure(alertFiles: string[]) {
   };
 }
 
-function findLatestBackup(backupDir: string, nowMs: number) {
+async function findLatestBackup(backupDir: string, nowMs: number) {
   if (!existsSync(backupDir)) return null;
 
   const candidates = readdirSync(backupDir)
@@ -93,7 +93,7 @@ function findLatestBackup(backupDir: string, nowMs: number) {
 
   for (const candidate of candidates) {
     try {
-      validateDatabaseBackupArtifact(candidate.fullPath);
+      await validateDatabaseBackupArtifact(candidate.fullPath);
     } catch {
       continue;
     }
@@ -110,9 +110,9 @@ function findLatestBackup(backupDir: string, nowMs: number) {
   return null;
 }
 
-export function inspectDatabaseBackupHealth(
+export async function inspectDatabaseBackupHealth(
   opts: InspectDatabaseBackupHealthOptions,
-): DatabaseBackupHealthStatus {
+): Promise<DatabaseBackupHealthStatus> {
   const warnings: DatabaseBackupHealthWarning[] = [];
   const now = opts.now ?? new Date();
   const maxAgeHours = Math.max(1, opts.maxAgeHours);
@@ -121,7 +121,7 @@ export function inspectDatabaseBackupHealth(
   let lastFailure: DatabaseBackupHealthStatus["lastFailure"] = null;
 
   try {
-    latestBackup = findLatestBackup(opts.backupDir, now.getTime());
+    latestBackup = await findLatestBackup(opts.backupDir, now.getTime());
     lastFailure = readLastFailure(alertFileCandidates(opts));
 
     if (!latestBackup) {

@@ -81,15 +81,15 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("validateDatabaseBackupArtifact", () => {
-  it("rejects near-empty gzip artifacts", () => {
+  it("rejects near-empty gzip artifacts", async () => {
     const tempDir = createTempDir("paperclip-backup-artifact-empty-");
     const emptyGzipPath = path.join(tempDir, "paperclip-empty.sql.gz");
     fs.writeFileSync(emptyGzipPath, gzipSync(""));
 
-    expect(() => validateDatabaseBackupArtifact(emptyGzipPath)).toThrow(/too small|no SQL payload/i);
+    await expect(validateDatabaseBackupArtifact(emptyGzipPath)).rejects.toThrow(/too small|no SQL payload/i);
   });
 
-  it("accepts a valid gzip backup payload", () => {
+  it("accepts a valid gzip backup payload", async () => {
     const tempDir = createTempDir("paperclip-backup-artifact-valid-");
     const backupPath = path.join(tempDir, "paperclip-valid.sql.gz");
     let sql = "-- Paperclip database backup\n";
@@ -100,7 +100,7 @@ describe("validateDatabaseBackupArtifact", () => {
     }
     fs.writeFileSync(backupPath, gz);
 
-    expect(() => validateDatabaseBackupArtifact(backupPath)).not.toThrow();
+    await expect(validateDatabaseBackupArtifact(backupPath)).resolves.toBeUndefined();
     expect(fs.statSync(backupPath).size).toBeGreaterThanOrEqual(MIN_DATABASE_BACKUP_GZIP_BYTES);
   });
 });
@@ -657,7 +657,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         for (const name of gzipFiles) {
           const fullPath = path.join(backupDir, name);
           expect(fs.statSync(fullPath).size).toBeGreaterThan(MIN_DATABASE_BACKUP_GZIP_BYTES);
-          validateDatabaseBackupArtifact(fullPath);
+          await validateDatabaseBackupArtifact(fullPath);
         }
         expect(fs.existsSync(`${result.backupFile}.partial`)).toBe(false);
       } finally {
