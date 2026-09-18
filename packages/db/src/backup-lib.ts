@@ -1,10 +1,20 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
-import { createGunzip, createGzip } from "node:zlib";
+import { createGunzip, createGzip, gunzipSync } from "node:zlib";
 import postgres from "postgres";
 
 export type BackupRetentionPolicy = {
@@ -72,6 +82,71 @@ const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
+/** Empty/near-empty gzip headers from a failed pg_dump probe are ~20 bytes. */
+export const MIN_DATABASE_BACKUP_GZIP_BYTES = 64;
+const BACKUP_PARTIAL_SUFFIX = ".partial";
+
+function isGzipCompressedBackupPath(filePath: string): boolean {
+  return filePath.endsWith(".gz") || filePath.endsWith(BACKUP_PARTIAL_SUFFIX);
+}
+
+function backupPartialPath(finalBackupFile: string): string {
+  return `${finalBackupFile}${BACKUP_PARTIAL_SUFFIX}`;
+}
+
+function removeBackupFileIfPresent(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the original backup failure if cleanup also fails.
+  }
+}
+
+function readBackupSqlPayload(backupFile: string): string {
+  if (isGzipCompressedBackupPath(backupFile)) {
+    return gunzipSync(readFileSync(backupFile)).toString("utf8").trim();
+  }
+  return readFileSync(backupFile, "utf8").trim();
+}
+
+/**
+ * Reject empty/near-empty gzip artifacts and empty SQL payloads before a backup
+ * can be treated as successful or selected for restore.
+ */
+export function validateDatabaseBackupArtifact(backupFile: string): void {
+  if (!existsSync(backupFile)) {
+    throw new Error(`Backup file not found: ${basename(backupFile)}`);
+  }
+
+  const sizeBytes = statSync(backupFile).size;
+  if (isGzipCompressedBackupPath(backupFile) && sizeBytes < MIN_DATABASE_BACKUP_GZIP_BYTES) {
+    throw new Error(
+      `Backup file is too small to be valid (${sizeBytes} bytes, minimum ${MIN_DATABASE_BACKUP_GZIP_BYTES}): ${basename(backupFile)}`,
+    );
+  }
+
+  let payload = "";
+  try {
+    payload = readBackupSqlPayload(backupFile);
+  } catch (error) {
+    throw new Error(
+      `Backup file is not readable gzip/SQL content: ${basename(backupFile)} (${sanitizeRestoreErrorMessage(error)})`,
+    );
+  }
+
+  if (payload.length === 0) {
+    throw new Error(`Backup file contains no SQL payload: ${basename(backupFile)}`);
+  }
+}
+
+async function finalizeCompressedBackup(finalBackupFile: string, partialBackupFile: string): Promise<number> {
+  validateDatabaseBackupArtifact(partialBackupFile);
+  removeBackupFileIfPresent(finalBackupFile);
+  renameSync(partialBackupFile, finalBackupFile);
+  validateDatabaseBackupArtifact(finalBackupFile);
+  return statSync(finalBackupFile).size;
+}
 
 function sanitizeRestoreErrorMessage(error: unknown): string {
   if (error && typeof error === "object") {
@@ -323,6 +398,8 @@ async function runPgDumpBackup(opts: {
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const partialBackupFile = backupPartialPath(opts.backupFile);
+  removeBackupFileIfPresent(partialBackupFile);
   const child = spawn(
     pgDumpBin,
     [
@@ -346,10 +423,17 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
-  ]);
+  try {
+    await Promise.all([
+      pipeline(child.stdout, createGzip(), createWriteStream(partialBackupFile)),
+      waitForChildExit(child, pgDumpBin),
+    ]);
+    await finalizeCompressedBackup(opts.backupFile, partialBackupFile);
+  } catch (error) {
+    removeBackupFileIfPresent(partialBackupFile);
+    removeBackupFileIfPresent(opts.backupFile);
+    throw error;
+  }
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -557,6 +641,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
+        validateDatabaseBackupArtifact(backupFile);
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
           backupFile,
@@ -1020,22 +1105,33 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
+    // Compress the SQL file with gzip (atomic finalize into the final .sql.gz path).
+    const partialBackupFile = backupPartialPath(backupFile);
+    removeBackupFileIfPresent(partialBackupFile);
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+    const gzWriteStream = createWriteStream(partialBackupFile);
+    try {
+      await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+      unlinkSync(sqlFile);
+      const sizeBytes = await finalizeCompressedBackup(backupFile, partialBackupFile);
+      const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
-    const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
-
-    return {
-      backupFile,
-      sizeBytes,
-      prunedCount,
-    };
+      return {
+        backupFile,
+        sizeBytes,
+        prunedCount,
+      };
+    } catch (error) {
+      removeBackupFileIfPresent(partialBackupFile);
+      removeBackupFileIfPresent(backupFile);
+      if (existsSync(sqlFile)) {
+        try { unlinkSync(sqlFile); } catch { /* ignore */ }
+      }
+      throw error;
+    }
   } catch (error) {
     await writer.abort();
+    removeBackupFileIfPresent(backupPartialPath(backupFile));
     if (existsSync(backupFile)) {
       try { unlinkSync(backupFile); } catch { /* ignore */ }
     }
@@ -1049,6 +1145,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 }
 
 export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
+  validateDatabaseBackupArtifact(opts.backupFile);
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   let psqlRestoreError: unknown = null;
   try {
@@ -1067,8 +1164,13 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
   try {
     await sql`SELECT 1`;
+    let restoredStatements = 0;
     for await (const statement of readRestoreStatements(opts.backupFile)) {
+      restoredStatements += 1;
       await sql.unsafe(statement).execute();
+    }
+    if (restoredStatements === 0) {
+      throw new Error(`Backup file contains no restorable SQL statements: ${basename(opts.backupFile)}`);
     }
   } catch (error) {
     const statementPreview = typeof error === "object" && error !== null && typeof (error as Record<string, unknown>).query === "string"

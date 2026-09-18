@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { validateDatabaseBackupArtifact } from "@paperclipai/db";
 
 export type DatabaseBackupHealthWarningCode =
   | "database_backup_check_failed"
@@ -90,16 +91,23 @@ function findLatestBackup(backupDir: string, nowMs: number) {
     })
     .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
 
-  const latest = candidates[0];
-  if (!latest) return null;
+  for (const candidate of candidates) {
+    try {
+      validateDatabaseBackupArtifact(candidate.fullPath);
+    } catch {
+      continue;
+    }
 
-  return {
-    name: basename(latest.fullPath),
-    path: latest.fullPath,
-    mtime: new Date(latest.stat.mtimeMs).toISOString(),
-    ageHours: roundHours((nowMs - latest.stat.mtimeMs) / 3_600_000),
-    sizeBytes: latest.stat.size,
-  };
+    return {
+      name: basename(candidate.fullPath),
+      path: candidate.fullPath,
+      mtime: new Date(candidate.stat.mtimeMs).toISOString(),
+      ageHours: roundHours((nowMs - candidate.stat.mtimeMs) / 3_600_000),
+      sizeBytes: candidate.stat.size,
+    };
+  }
+
+  return null;
 }
 
 export function inspectDatabaseBackupHealth(
